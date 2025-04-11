@@ -1,0 +1,297 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import {
+    SafeAreaView, StyleSheet, View, Text, Button, PermissionsAndroid,
+    Platform, AppState, TouchableOpacity, ScrollView, Alert,
+    ActivityIndicator, Dimensions, PixelRatio // Added PixelRatio
+} from 'react-native';
+import { useDispatch, useSelector } from 'react-redux';
+import { accelerometer, SensorTypes, setUpdateIntervalForType } from 'react-native-sensors';
+import Geolocation, { GeolocationResponse } from 'react-native-geolocation-service';
+import { Subscription } from 'rxjs';
+import Icon from 'react-native-vector-icons/FontAwesome';
+import IconMI from 'react-native-vector-icons/MaterialIcons';
+
+// --- TensorFlow.js and Pose Detection Imports ---
+import * as tf from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-react-native'; // Import side effects
+import * as poseDetection from '@tensorflow-models/pose-detection';
+import * as ScreenOrientation from 'expo-screen-orientation'; // Or similar library if not using Expo
+import { cameraWithTensors } from '@tensorflow/tfjs-react-native'; // Helper for camera tensor
+
+// --- Camera Imports ---
+import { Camera, useCameraDevice, useFrameProcessor, CameraPermissionStatus, Frame } from 'react-native-vision-camera';
+import { Worklets, useSharedValue, useAnimatedReaction, runOnJS } from 'react-native-reanimated';
+
+// --- Redux Imports ---
+import { addExercise, Exercise, ExerciseType } from '../features/exercise/exerciseSlice';
+import { addEnergy, addExperience } from '../features/user/userSlice';
+import { RootState, AppDispatch } from '../store';
+
+// --- Rep Counting Logic (Needs implementation based on MoveNet keypoints) ---
+import { countPushupRep, countSitupRep, countSquatRep, PoseData, ExerciseCounterState } from '../utils/exerciseCounterLogic'; // Assume this file exists and functions are adapted
+
+// --- Constants ---
+// Keep Run Tracker constants...
+const SENSOR_UPDATE_INTERVAL = 100; const LOCATION_UPDATE_INTERVAL = 2000; const LOCATION_MAX_AGE = 5000; const STEP_THRESHOLD = 1.2; const STEP_DEBOUNCE = 350; const DISTANCE_FILTER_THRESHOLD = 0.005;
+// Camera/Model Constants
+const MODEL_UPDATE_INTERVAL = 150; // ms - How often to run inference (balance performance/accuracy)
+
+// --- Types ---
+interface LocationPoint { latitude: number; longitude: number; timestamp: number; }
+
+// --- Helpers ---
+function haversineDistance(coords1: LocationPoint, coords2: LocationPoint): number { /* ... */ function toRad(x: number) { return x * Math.PI / 180; } const R = 6371; const dLat = toRad(coords2.latitude - coords1.latitude); const dLon = toRad(coords2.longitude - coords1.longitude); const lat1 = toRad(coords1.latitude); const lat2 = toRad(coords2.latitude); const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.sin(dLon / 2) * Math.sin(dLon / 2) * Math.cos(lat1) * Math.cos(lat2); const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); return R * c; }
+const formatExerciseName = (type: ExerciseType | null): string => { if (!type) return ''; switch (type) { case 'pushup': return 'Push-ups'; case 'situp': return 'Sit-ups'; case 'squat': return 'Squats'; case 'run': return 'Run'; default: return type.charAt(0).toUpperCase() + type.slice(1); } };
+
+// --- Run Tracker Hook ---
+function useRunTracker() { /* ... (Keep implementation from previous step) ... */ const [distance, setDistance] = useState(0); const [steps, setSteps] = useState(0); const [currentSpeed, setCurrentSpeed] = useState(0); const [status, setStatus] = useState<'idle' | 'requesting_permission' | 'tracking' | 'error'>('idle'); const [error, setError] = useState<string | null>(null); const watchId = useRef<number | null>(null); const lastLocation = useRef<LocationPoint | null>(null); const sensorSubscription = useRef<Subscription | null>(null); const stepDetectionState = useRef<{ timestamp: number; value: number, peakDetected: boolean }>({ timestamp: 0, value: 0, peakDetected: false }); const requestLocationPermission = useCallback(async (): Promise<boolean> => { if (Platform.OS === 'ios') { const auth = await Geolocation.requestAuthorization('whenInUse'); return auth === 'granted'; } if (Platform.OS === 'android') { try { const granted = await PermissionsAndroid.request( PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION, { title: 'Location Permission Required', message: 'Zero To Hero needs access to your location to track your runs.', buttonPositive: 'OK', buttonNegative: 'Cancel' }, ); return granted === PermissionsAndroid.RESULTS.GRANTED; } catch (err) { console.warn(err); return false; } } return false; }, []); const processAccelerometerData = useCallback(({ x, y, z, timestamp }: { x: number; y: number; z: number; timestamp: number }) => { const magnitude = Math.sqrt(x * x + y * y + z * z); const now = Date.now(); const timeSinceLastStep = now - stepDetectionState.current.timestamp; const GRAVITY_APPROX = 9.8; if (magnitude > GRAVITY_APPROX + STEP_THRESHOLD && timeSinceLastStep > STEP_DEBOUNCE) { if (!stepDetectionState.current.peakDetected) { setSteps(s => s + 1); stepDetectionState.current = { timestamp: now, value: magnitude, peakDetected: true }; } } else if (magnitude < GRAVITY_APPROX) { stepDetectionState.current.peakDetected = false; } stepDetectionState.current.value = magnitude; }, []); const startTracking = useCallback(async () => { setStatus('requesting_permission'); setError(null); const hasPermission = await requestLocationPermission(); if (!hasPermission) { setError('Location permission denied.'); setStatus('error'); return; } setStatus('tracking'); setDistance(0); setSteps(0); setCurrentSpeed(0); lastLocation.current = null; stepDetectionState.current = { timestamp: 0, value: 0, peakDetected: false }; if (watchId.current !== null) Geolocation.clearWatch(watchId.current); sensorSubscription.current?.unsubscribe(); watchId.current = Geolocation.watchPosition( (position) => { const { latitude, longitude, speed } = position.coords; const timestamp = position.timestamp; const currentLocation: LocationPoint = { latitude, longitude, timestamp }; if (lastLocation.current) { const distanceMoved = haversineDistance(lastLocation.current, currentLocation); if (distanceMoved > DISTANCE_FILTER_THRESHOLD) { setDistance(d => d + distanceMoved); } } lastLocation.current = currentLocation; setCurrentSpeed(speed ? Math.max(0, speed * 3.6) : 0); setError(null); }, (locError) => { console.error('Geolocation Error:', locError); setError(`Location error: ${locError.code} - ${locError.message}`); }, { accuracy: { android: 'high', ios: 'best' }, enableHighAccuracy: true, distanceFilter: 5, interval: LOCATION_UPDATE_INTERVAL, fastestInterval: LOCATION_UPDATE_INTERVAL / 2, forceRequestLocation: true, showLocationDialog: true, useSignificantChanges: false } ); setUpdateIntervalForType(SensorTypes.accelerometer, SENSOR_UPDATE_INTERVAL); sensorSubscription.current = accelerometer.subscribe(processAccelerometerData); }, [requestLocationPermission, processAccelerometerData]); const stopTracking = useCallback(() => { if (watchId.current !== null) { Geolocation.clearWatch(watchId.current); watchId.current = null; } sensorSubscription.current?.unsubscribe(); sensorSubscription.current = null; setStatus('idle'); setCurrentSpeed(0); return { finalDistance: distance, finalSteps: steps }; }, [distance, steps]); useEffect(() => stopTracking, [stopTracking]); return { distance, steps, currentSpeed, status, error, startTracking, stopTracking }; }
+
+// --- Main Screen Component ---
+const ExerciseScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
+  const dispatch: AppDispatch = useDispatch();
+  const userId = useSelector((state: RootState) => state.user.id);
+
+  const [selectedExercise, setSelectedExercise] = useState<ExerciseType | null>(null);
+
+  // Run Tracker Hook
+  const { distance, steps, currentSpeed, status: runStatus, error: runError, startTracking: startRunTracking, stopTracking: stopRunTracking } = useRunTracker();
+
+  // --- Camera & Pose Estimation State ---
+  const [cameraPermission, setCameraPermission] = useState<CameraPermissionStatus>('not-determined');
+  const [tfReady, setTfReady] = useState(false);
+  const [poseDetector, setPoseDetector] = useState<poseDetection.PoseDetector | null>(null);
+  const [isTrackingActive, setIsTrackingActive] = useState(false); // General tracking flag
+  const [repCount, setRepCount] = useState(0);
+  const [feedbackMessage, setFeedbackMessage] = useState<string>('');
+  const device = useCameraDevice('front');
+  const exerciseState = useSharedValue<ExerciseCounterState>({ count: 0, stage: 'start', feedback: '' });
+  const exerciseTypeRef = useRef<ExerciseType | null>(null);
+  const lastFrameTime = useRef<number>(0); // For throttling frame processing
+
+  // --- Permissions ---
+  const requestCameraPerm = useCallback(async () => { /* ... same as before ... */ console.log('Requesting camera permission...'); const permission = await Camera.requestCameraPermission(); console.log(`Camera permission status: ${permission}`); if (permission === 'denied') Alert.alert('Permission Denied', 'Camera access is required to track exercises.'); setCameraPermission(permission); return permission === 'granted'; }, []);
+  useEffect(() => { Camera.getCameraPermissionStatus().then(setCameraPermission); }, []);
+
+  // --- Initialize TensorFlow.js and Load Model ---
+  useEffect(() => {
+    let isMounted = true;
+    async function setupTf() {
+        try {
+            await tf.ready(); // Wait for TFJS backend to be ready
+            const model = poseDetection.SupportedModels.MoveNet;
+            // Configure detector (Lightning is faster, Thunder more accurate)
+            const detectorConfig: poseDetection.movenet.MoveNetModelConfig = {
+                modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+                enableSmoothing: true, // Optional smoothing
+            };
+            const detector = await poseDetection.createDetector(model, detectorConfig);
+            console.log('MoveNet detector loaded successfully.');
+            if (isMounted) {
+                setPoseDetector(detector);
+                setTfReady(true);
+            }
+        } catch(err) {
+             console.error("TFJS/Model Setup Error:", err);
+             if(isMounted) setFeedbackMessage("Error loading model.");
+        }
+    }
+    setupTf();
+    return () => {
+        isMounted = false;
+        poseDetector?.dispose(); // Clean up detector on unmount
+        console.log("Pose detector disposed.");
+    }
+  }, []); // Run once on mount
+
+
+  // --- Frame Processor ---
+  const frameProcessor = useFrameProcessor((frame: Frame) => {
+    'worklet';
+    // Only process if tracking is active and model is ready
+    if (!isTrackingActive || !poseDetector || !tfReady) {
+        return;
+    }
+
+    // Throttle processing
+    const now = Date.now();
+    if (now - lastFrameTime.current < MODEL_UPDATE_INTERVAL) {
+        return;
+    }
+    lastFrameTime.current = now;
+
+    // --- !!! Pose Detection & Rep Counting !!! ---
+    // This part is complex and performance-sensitive.
+    // Running TFJS inference directly in the worklet might block if not careful.
+    // Using runOnJS for inference is too slow for real-time.
+    // The ideal solution often involves JSI bindings or native modules.
+    // Here's a conceptual version using runOnJS for the *entire* process
+    // (SIMPLIFIED & LIKELY NOT PERFORMANT ENOUGH FOR REAL-TIME):
+    runOnJS(async () => {
+        try {
+             // 1. Convert Frame to Tensor (This is the HARD part - needs specific implementation)
+             // Example using a hypothetical function (replace with actual implementation)
+             // const imageTensor : tf.Tensor3D | null = convertFrameToTensor(frame);
+             // For now, we skip this and the inference.
+             const imageTensor = null; // Placeholder
+
+             if (imageTensor) {
+                 // 2. Run Pose Detection
+                 const poses = await poseDetector.estimatePoses(imageTensor, {
+                     maxPoses: 1, // Detect single pose
+                     flipHorizontal: false // Adjust if needed based on camera/output
+                 });
+                 tf.dispose(imageTensor); // Dispose tensor to free memory
+
+                 if (poses && poses.length > 0 && poses[0].keypoints) {
+                    const keypoints = poses[0].keypoints;
+                    const currentExercise = selectedExercise; // Access via closure or ref
+
+                    // 3. Run Rep Counting Logic (on JS thread)
+                    let newState = exerciseState.value; // Get current state
+                    if (currentExercise === 'pushup') {
+                        newState = countPushupRep(keypoints, exerciseState.value);
+                    } else if (currentExercise === 'situp') {
+                        newState = countSitupRep(keypoints, exerciseState.value);
+                    } else if (currentExercise === 'squat') {
+                        newState = countSquatRep(keypoints, exerciseState.value);
+                    }
+
+                    // 4. Update Shared Value if state changed
+                    if (newState.count !== exerciseState.value.count || newState.feedback !== exerciseState.value.feedback) {
+                        // Update happens on JS thread, reaction will pick it up
+                        exerciseState.value = newState;
+                    }
+                 } else {
+                    // No pose detected in this frame
+                    // Optionally update feedback via runOnJS if needed
+                    // runOnJS(setFeedbackMessage)('No pose detected');
+                 }
+
+             } else {
+                 // --- Simulation when tensor conversion fails ---
+                 // Simulate rep counting for testing UI without real inference
+                 let newState = exerciseState.value;
+                 const currentExercise = selectedExercise;
+                 if (currentExercise === 'pushup') newState = countPushupRep(null, exerciseState.value);
+                 else if (currentExercise === 'situp') newState = countSitupRep(null, exerciseState.value);
+                 else if (currentExercise === 'squat') newState = countSquatRep(null, exerciseState.value);
+                 if (newState.count !== exerciseState.value.count || newState.feedback !== exerciseState.value.feedback) {
+                     exerciseState.value = newState;
+                 }
+                 // --- End Simulation ---
+             }
+
+        } catch(err) {
+             console.error("Error during pose estimation/counting:", err);
+             // Optionally update feedback via runOnJS
+             // runOnJS(setFeedbackMessage)('Processing Error');
+        }
+    })(); // Immediately invoke the async function run on JS thread
+
+
+  }, [isTrackingActive, poseDetector, tfReady, selectedExercise]); // Dependencies for the processor
+
+
+  // --- Update React State from Shared Value ---
+  useAnimatedReaction(
+    () => exerciseState.value,
+    (currentState, previousState) => {
+      if (!previousState || currentState.count !== previousState.count) {
+        runOnJS(setRepCount)(currentState.count);
+      }
+      if (!previousState || (currentState.feedback !== previousState.feedback && currentState.feedback)) {
+        runOnJS(setFeedbackMessage)(currentState.feedback);
+      }
+    },
+    [exerciseState]
+  );
+
+
+  // --- Handlers ---
+  const handleSelectExercise = (type: ExerciseType) => { /* ... same as before ... */ if ((runStatus === 'tracking' && type !== 'run') || (isTrackingActive && selectedExercise !== 'run' && type === 'run')) { Alert.alert("Tracking Active", "Stop the current workout before switching types."); return; } if(type !== 'run') { if (runStatus === 'tracking') stopRunTracking(); setRepCount(0); setFeedbackMessage(''); exerciseState.value = { count: 0, stage: 'start', feedback: '' }; setIsTrackingActive(false); } else { setIsTrackingActive(false); } console.log("Selected exercise:", type); setSelectedExercise(type); exerciseTypeRef.current = type; };
+
+  const handleStartStop = async () => {
+    if (!selectedExercise) return;
+    if (selectedExercise === 'run') {
+       if (runStatus === 'tracking') { /* ... Stop Run Logic ... */ const { finalDistance, finalSteps } = stopRunTracking(); if (finalDistance > 0 || finalSteps > 0) { const powerPerKm = 10; const powerGenerated = Math.round(finalDistance * powerPerKm); const energyGained = Math.round(powerGenerated / 2); const runData = { userId, exercise: { type: 'run' as const, count: parseFloat(finalDistance.toFixed(2)), date: new Date().toISOString(), powerGenerated: 0, formQuality: null, metadata: { steps: finalSteps } } satisfies Omit<Exercise, 'id'> }; dispatch(addExercise(runData)); if (energyGained > 0) dispatch(addEnergy(energyGained)); dispatch(addExperience(finalSteps)); Alert.alert( "Run Saved!", `Distance: ${finalDistance.toFixed(2)}km, Steps: ${finalSteps}, Energy: +${energyGained}` ); } else { Alert.alert("Run Stopped", "No significant distance/steps."); } }
+       else if (runStatus === 'idle' || runStatus === 'error') { startRunTracking(); }
+    } else {
+      // Camera Exercise Logic
+      if (isTrackingActive) {
+        // Stop Camera Tracking
+        setIsTrackingActive(false); // This will detach frame processor implicitly
+        const finalRepCount = repCount;
+        setFeedbackMessage('Workout Stopped.');
+        setRepCount(0); exerciseState.value = { count: 0, stage: 'start', feedback: '' };
+        if (finalRepCount > 0 && userId) {
+             const powerPerRep = 5; const energyPerRep = 0.5; const xpPerRep = 2; const totalPowerGenerated = Math.round(finalRepCount * powerPerRep); const totalEnergyGained = Math.round(finalRepCount * energyPerRep); const totalXpGained = Math.round(finalRepCount * xpPerRep); const exerciseData = { userId, exercise: { type: selectedExercise, count: finalRepCount, date: new Date().toISOString(), powerGenerated: totalPowerGenerated, formQuality: 0.8, metadata: {} } satisfies Omit<Exercise, 'id'> }; dispatch(addExercise(exerciseData)); if (totalEnergyGained > 0) dispatch(addEnergy(totalEnergyGained)); if (totalXpGained > 0) dispatch(addExperience(totalXpGained)); Alert.alert("Workout Saved!", `Exercise: ${formatExerciseName(selectedExercise)}\nReps: ${finalRepCount}\nPower: +${totalPowerGenerated}\nEnergy: +${totalEnergyGained}\nXP: +${totalXpGained}`);
+        } else { Alert.alert("Workout Stopped", "No reps recorded."); }
+      } else {
+        // Start Camera Tracking
+        if (cameraPermission !== 'granted') { const granted = await requestCameraPerm(); if (!granted) return; }
+        if (!device) { Alert.alert("Error", "No suitable camera device found."); return; }
+        if (!tfReady || !poseDetector) { Alert.alert("Error", "Pose detection model not ready yet."); return; }
+        setRepCount(0); setFeedbackMessage('Get ready...'); exerciseState.value = { count: 0, stage: 'start', feedback: '' };
+        setIsTrackingActive(true); // Start camera session and attach frame processor
+      }
+    }
+  };
+
+  // --- Render UI ---
+  const renderCameraStatus = () => { /* ... */ if (cameraPermission === 'not-determined') { return <Button title="Enable Camera Access" onPress={requestCameraPerm} />; } if (cameraPermission === 'denied') { return <Text style={styles.errorText}>Camera permission denied.</Text>; } if (!device) { return <Text style={styles.errorText}>No front camera device found.</Text>; } if (!tfReady) { return <View><ActivityIndicator /><Text style={styles.statusText}>Loading Model...</Text></View> } return null; }
+
+  const renderTrackingUI = () => {
+    if (!selectedExercise) { return ( <View style={styles.placeholderContainer}><Text style={styles.placeholderText}>Select an exercise above to begin.</Text></View> ); }
+    if (selectedExercise === 'run') { return ( /* ... Run UI ... */ <View style={styles.trackerContainer}> <View style={styles.trackerBox}> <Text style={styles.metricLabel}>Distance</Text> <Text style={styles.metricValue}>{distance.toFixed(2)} <Text style={styles.metricUnit}>km</Text></Text> <Text style={styles.metricLabel}>Steps</Text> <Text style={styles.metricValue}>{steps}</Text> <Text style={styles.metricLabel}>Current Speed</Text> <Text style={styles.metricValue}>{currentSpeed.toFixed(1)} <Text style={styles.metricUnit}>km/h</Text></Text> {runError && <Text style={styles.errorText}>Error: {runError}</Text>} <TouchableOpacity style={[styles.button, runStatus === 'tracking' ? styles.stopButton : styles.startButton, runStatus === 'requesting_permission' && styles.disabledButton]} onPress={handleStartStop} disabled={runStatus === 'requesting_permission'} > <Text style={styles.buttonText}> {runStatus === 'tracking' ? 'Stop Run' : runStatus === 'requesting_permission' ? 'Starting...' : 'Start Run'} </Text> </TouchableOpacity> {runStatus === 'tracking' && <Text style={styles.statusText}>Tracking run...</Text>} {runStatus === 'requesting_permission' && <Text style={styles.statusText}>Requesting permission...</Text>} {runStatus === 'error' && !runError && <Text style={styles.statusText}>Idle (Error occurred)</Text>} {runStatus === 'idle' && <Text style={styles.statusText}>Ready to start run.</Text>} </View> </View> ); }
+
+    // --- Render Camera Exercise UI ---
+    const cameraStatusElement = renderCameraStatus();
+    const canStartCamera = cameraPermission === 'granted' && device && tfReady;
+
+    return (
+        <View style={styles.trackerContainer}>
+            <Text style={styles.exerciseTitle}>{formatExerciseName(selectedExercise)}</Text>
+            <View style={styles.cameraContainer}>
+                {cameraStatusElement ? ( <View style={styles.cameraPlaceholder}>{cameraStatusElement}</View> )
+                 : canStartCamera ? (
+                    <Camera
+                        style={StyleSheet.absoluteFill}
+                        device={device}
+                        isActive={isTrackingActive && AppState.currentState === 'active'}
+                        frameProcessor={isTrackingActive ? frameProcessor : undefined}
+                        frameProcessorFps={5} // Limit FPS to reduce load initially
+                        orientation="portrait"
+                        // pixelFormat='yuv' // Might be needed for some tensor conversions
+                    />
+                 ) : ( <View style={styles.cameraPlaceholder}><ActivityIndicator /></View> )}
+                 {isTrackingActive && ( // Only show overlay when tracking
+                    <View style={styles.cameraOverlay}>
+                        <Text style={styles.repCountText}>{repCount}</Text>
+                        <Text style={styles.feedbackText}>{feedbackMessage || ' '}</Text>
+                    </View>
+                 )}
+            </View>
+            <TouchableOpacity
+                style={[styles.button, isTrackingActive ? styles.stopButton : styles.startButton, !canStartCamera && styles.disabledButton]}
+                onPress={handleStartStop}
+                disabled={!canStartCamera}
+            >
+                <Text style={styles.buttonText}> {isTrackingActive ? 'Stop Workout' : 'Start Workout'} </Text>
+            </TouchableOpacity>
+        </View>
+     );
+  };
+
+  // Main Return
+  return ( /* ... Same as before, renders selection and tracking UI ... */ <SafeAreaView style={styles.safeArea}> <ScrollView contentContainerStyle={styles.container}> <Text style={styles.heading}>Track Workout</Text> <View style={styles.selectionContainer}> {(['pushup', 'situp', 'squat', 'run'] as ExerciseType[]).map((type) => ( <TouchableOpacity key={type} style={[ styles.selectionButton, selectedExercise === type && styles.selectionButtonActive, ((runStatus === 'tracking' && type !== 'run') || (isTrackingActive && selectedExercise !== 'run' && type === 'run')) && styles.selectionButtonDisabled ]} onPress={() => handleSelectExercise(type)} disabled={(runStatus === 'tracking' && type !== 'run') || (isTrackingActive && selectedExercise !== 'run' && type === 'run')} > <Text style={[ styles.selectionButtonText, selectedExercise === type && styles.selectionButtonTextActive, ((runStatus === 'tracking' && type !== 'run') || (isTrackingActive && selectedExercise !== 'run' && type === 'run')) && styles.selectionButtonTextDisabled ]}> {formatExerciseName(type)} </Text> </TouchableOpacity> ))} </View> {renderTrackingUI()} </ScrollView> </SafeAreaView> );
+};
+
+// --- Styles ---
+const styles = StyleSheet.create({ /* ... Keep styles from previous version ... */
+    safeArea: { flex: 1, backgroundColor: '#F8F8F8', }, container: { flexGrow: 1, padding: 20, alignItems: 'center', }, heading: { fontSize: 28, fontWeight: 'bold', marginBottom: 20, color: '#111827', textAlign: 'center', }, selectionContainer: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginBottom: 25, width: '100%', }, selectionButton: { paddingVertical: 10, paddingHorizontal: 18, backgroundColor: '#e5e7eb', borderRadius: 20, margin: 5, }, selectionButtonActive: { backgroundColor: '#6366f1', }, selectionButtonDisabled: { backgroundColor: '#d1d5db', opacity: 0.7, }, selectionButtonText: { color: '#374151', fontWeight: '600', textAlign: 'center', }, selectionButtonTextActive: { color: '#ffffff', }, selectionButtonTextDisabled: { color: '#6b7280', }, trackerContainer: { width: '100%', maxWidth: 500, padding: 20, backgroundColor: '#ffffff', borderRadius: 15, shadowColor: "#000", shadowOffset: { width: 0, height: 2, }, shadowOpacity: 0.1, shadowRadius: 5, elevation: 5, alignItems: 'center', minHeight: 300, }, trackerBox: { alignItems: 'center', width: '100%', }, metricLabel: { fontSize: 16, color: '#6b7280', marginTop: 10, }, metricValue: { fontSize: 32, fontWeight: 'bold', color: '#1f2937', marginBottom: 3, }, metricUnit: { fontSize: 14, fontWeight: 'normal', color: '#4b5563', }, statusText: { fontSize: 14, fontStyle: 'italic', color: '#6b7280', marginTop: 10, }, errorText: { fontSize: 14, color: '#dc2626', marginTop: 10, textAlign: 'center', fontWeight: '500', }, button: { marginTop: 20, paddingVertical: 12, paddingHorizontal: 40, borderRadius: 25, alignItems: 'center', justifyContent: 'center', minWidth: 180, }, startButton: { backgroundColor: '#10b981', }, stopButton: { backgroundColor: '#ef4444', }, disabledButton: { backgroundColor: '#9ca3af', opacity: 0.8, }, buttonText: { color: '#ffffff', fontSize: 18, fontWeight: 'bold', }, placeholderContainer: { alignItems: 'center', justifyContent: 'center', paddingVertical: 40, width: '100%', marginTop: 20, }, placeholderText: { fontSize: 18, color: '#6b7280', textAlign: 'center', marginBottom: 5, }, placeholderSubText: { fontSize: 14, color: '#9ca3af', textAlign: 'center', },
+    // --- Camera Specific Styles ---
+    exerciseTitle: { fontSize: 22, fontWeight: 'bold', color: '#1f2937', marginBottom: 15, }, cameraContainer: { width: '100%', aspectRatio: 3 / 4, backgroundColor: '#000', borderRadius: 10, overflow: 'hidden', marginBottom: 15, position: 'relative', justifyContent: 'center', alignItems: 'center', }, cameraPlaceholder: { flex: 1, width: '100%', justifyContent: 'center', alignItems: 'center', backgroundColor: '#e5e7eb', }, cameraOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'space-between', alignItems: 'center', padding: 15, }, repCountText: { fontSize: 72, fontWeight: 'bold', color: 'rgba(255, 255, 255, 0.9)', textShadowColor: 'rgba(0, 0, 0, 0.75)', textShadowOffset: { width: -1, height: 1 }, textShadowRadius: 10, }, feedbackText: { fontSize: 18, fontWeight: '500', color: 'rgba(255, 255, 255, 0.9)', backgroundColor: 'rgba(0, 0, 0, 0.6)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 15, textAlign: 'center', },
+    centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 }, // For loading/error centering
+});
+
+export default ExerciseScreen;

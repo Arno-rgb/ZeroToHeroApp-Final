@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "349363592778",
+    "project_id": "heroapp-886f1",
+    "storage_bucket": "heroapp-886f1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:349363592778:android:c0308dc2b5399331f290b3",
+        "android_client_info": {
+          "package_name": "com.heroapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDgJxsIlniuYDzPB9vFdF1YOXpLPiUq3H0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
