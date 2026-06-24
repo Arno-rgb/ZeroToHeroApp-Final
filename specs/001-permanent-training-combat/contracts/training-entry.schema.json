@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "training-entry.schema.json",
+  "title": "TrainingEvent",
+  "type": "object",
+  "required": [
+    "id",
+    "userId",
+    "exerciseId",
+    "movementFamily",
+    "metric",
+    "rawVolume",
+    "creditedVolume",
+    "performedAt",
+    "localDate",
+    "timezoneOffsetMinutes",
+    "source",
+    "verificationTier",
+    "creditPolicyVersion",
+    "createdAt"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "userId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exerciseId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "movementFamily": {
+      "enum": [
+        "upper_strength",
+        "lower_strength",
+        "core",
+        "endurance",
+        "mobility"
+      ]
+    },
+    "metric": {
+      "enum": [
+        "reps",
+        "seconds",
+        "metres"
+      ]
+    },
+    "rawVolume": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "creditedVolume": {
+      "type": "number",
+      "minimum": 0
+    },
+    "performedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "localDate": {
+      "type": "string",
+      "format": "date"
+    },
+    "timezoneOffsetMinutes": {
+      "type": "integer",
+      "minimum": -840,
+      "maximum": 840
+    },
+    "source": {
+      "enum": [
+        "manual",
+        "guided_workout",
+        "camera",
+        "wearable",
+        "migration"
+      ]
+    },
+    "verificationTier": {
+      "enum": [
+        "self_reported",
+        "timer_supported",
+        "sensor_supported",
+        "camera_verified",
+        "device_verified"
+      ]
+    },
+    "formScore": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "creditPolicyVersion": {
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "supersedesEventId": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 500
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "creditedVolume": {
+            "type": "number"
+          }
+        }
+      },
+      "then": {
+        "description": "Application validation must also enforce creditedVolume <= rawVolume."
+      }
+    }
+  ],
+  "additionalProperties": false
+}

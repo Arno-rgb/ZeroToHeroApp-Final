@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "battle-result.schema.json",
+  "title": "BattleRecord",
+  "type": "object",
+  "required": [
+    "id",
+    "userId",
+    "bossId",
+    "startedAt",
+    "endedAt",
+    "result",
+    "durationMs",
+    "damageDealt",
+    "damageTaken",
+    "attacksUsed",
+    "evadesAttempted",
+    "evadesSucceeded",
+    "buildSnapshot",
+    "combatRulesVersion",
+    "seed"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "userId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bossId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "endedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "result": {
+      "enum": [
+        "victory",
+        "defeat",
+        "abandoned"
+      ]
+    },
+    "durationMs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "damageDealt": {
+      "type": "number",
+      "minimum": 0
+    },
+    "damageTaken": {
+      "type": "number",
+      "minimum": 0
+    },
+    "attacksUsed": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "evadesAttempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "evadesSucceeded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "buildSnapshot": {
+      "type": "object"
+    },
+    "combatRulesVersion": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seed": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false
+}

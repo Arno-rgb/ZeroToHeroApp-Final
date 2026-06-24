@@ -1,0 +1,60 @@
+There are a few common reasons why the keypoint drawings (lines or circles) might not appear over your camera feed:
+
+Coordinate Scaling:
+The pose detector (MoveNet) may return normalized coordinates (values between 0 and 1) rather than pixel values. In that case, you need to multiply the coordinates by the canvas (or video) width and height to correctly position the drawings.
+
+Canvas Size Mismatch:
+Ensure that the canvas size exactly matches the video element’s dimensions so that the drawn keypoints appear in the correct locations.
+
+Insufficient Lighting or Incorrect Camera Angle:
+Pose detectors rely on clear, well-lit images. If the camera feed is too dark or your lower body isn’t fully in view, the detector may not return reliable keypoints.
+
+Model Configuration or Results:
+There’s a chance that the model isn’t being fed the image correctly or the results aren’t being processed as expected. Logging the keypoints can help debug this.
+
+Below is an updated snippet for your drawing function that scales the coordinates if they are normalized. You can try replacing your current drawKeypoints function with this one to see if it helps:
+
+tsx
+Copy
+Edit
+const drawKeypoints = (keypoints: any, ctx: CanvasRenderingContext2D, width: number, height: number) => {
+  keypoints.forEach((point: any) => {
+    // Assume that if the point.x is less than 1, it's normalized.
+    const x = point.x < 1 ? point.x * width : point.x;
+    const y = point.y < 1 ? point.y * height : point.y;
+    if (point.score > 0.3 || (point.visibility && point.visibility > 0.3)) {
+      ctx.beginPath();
+      ctx.arc(x, y, 6, 0, 2 * Math.PI);
+      ctx.fillStyle = 'red';
+      ctx.fill();
+    }
+  });
+};
+And then update your detectPose function (or wherever you call drawKeypoints) like this:
+
+tsx
+Copy
+Edit
+if (canvasRef.current) {
+  const ctx = canvasRef.current.getContext('2d');
+  if (ctx) {
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    drawKeypoints(keypoints, ctx, canvasRef.current.width, canvasRef.current.height);
+  }
+}
+Debugging Steps:
+
+Log Keypoints:
+Add a console log inside your onPoseResults function to check if keypoints are being returned:
+
+tsx
+Copy
+Edit
+console.log("Detected keypoints:", keypoints);
+Verify Canvas and Video Dimensions:
+Double-check that both your <video> and <canvas> elements have the same width and height (e.g., 640x480).
+
+Lighting & Position:
+Ensure you’re in a well-lit area and that your entire lower body is clearly visible.
+
+Try these modifications and debugging steps. If the issue persists, you can share the console output, and we can further troubleshoot the detection logic.

@@ -1,164 +1,370 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Exercise, ExerciseType } from '../features/exercise/exerciseSlice'; // Assuming types are exported from slice
-import { UserData } from '../features/user/userSlice'; // Assuming UserData is defined/exported here
+import Dexie from 'dexie';
+import {
+  ExerciseType,
+  TrainingEvent,
+  TrainingSource,
+  VerificationTier,
+  calculateCreditedVolume,
+  createTrainingEvent,
+  displayVolume,
+  toLocalDate,
+} from '../domain/training';
+import { StatSnapshot } from '../domain/progression';
+import { BattleRecord } from '../domain/combat';
 
-// Define keys for AsyncStorage
-const USER_KEY = '@ZeroToHero:user';
-const EXERCISE_HISTORY_KEY = '@ZeroToHero:exerciseHistory';
-const BATTLE_HISTORY_KEY = '@ZeroToHero:battleHistory'; // If needed later
-
-// Define types if not imported (ensure consistency with slices)
-// Re-defining here for clarity, but importing from slices is better
-/*
-export type ExerciseType = 'pushup' | 'situp' | 'squat' | 'run';
-export interface Exercise { id: string; userId: string; type: ExerciseType; count: number; date: string; powerGenerated: number; formQuality: number; }
-export interface UserData { id: string; name: string; level: number; tier: number; experience: number; energy: number; maxEnergy: number; heroTitle: string; avatarCustomization: { costume: string; color: string; }; createdAt: string; lastLogin: string; }
-export interface BattleData { id: string; userId: string; bossId: string; date: string; result: 'victory' | 'defeat'; damageDealt: number; powerUsed: { strike: number; core: number; force: number; endurance: number; }; }
-*/
-
-// Helper function to generate unique IDs (simple version)
-function generateId(): string {
-  return `id_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+export interface UserData {
+  id: string;
+  name: string;
+  level: number;
+  tier: number;
+  experience: number;
+  energy: number;
+  maxEnergy: number;
+  ledgerRevision: number;
+  heroTitle: string;
+  avatarCustomization: {
+    costume: string;
+    color: string;
+  };
+  createdAt: string;
+  lastLogin: string;
 }
 
-// --- User Data Functions ---
+export interface ExerciseData {
+  id: string;
+  userId: string;
+  type: ExerciseType;
+  count: number;
+  date: string;
+  performedAt: string;
+  localDate: string;
+  rawVolume: number;
+  creditedVolume: number;
+  creditExplanation?: string;
+  powerGenerated: number;
+  formQuality: number;
+}
 
-export async function getOrCreateUser(): Promise<UserData> {
-  console.log('DB: Attempting to get user from AsyncStorage...');
-  try {
-    const existingUserData = await AsyncStorage.getItem(USER_KEY);
-    if (existingUserData !== null) {
-      console.log('DB: User found.');
-      const user = JSON.parse(existingUserData) as UserData;
-      // Ensure essential fields exist from older versions if necessary
-      user.energy = typeof user.energy === 'number' ? user.energy : 100;
-      user.maxEnergy = typeof user.maxEnergy === 'number' ? user.maxEnergy : 100;
-      return user;
-    } else {
-      console.log('DB: No user found, creating default user...');
-      const userId = generateId();
-      const newUser: UserData = {
-        id: userId,
-        name: 'Hero',
-        level: 1,
-        tier: 0,
-        experience: 0,
-        energy: 100,
-        maxEnergy: 100,
-        heroTitle: 'Beginner',
-        avatarCustomization: { costume: 'basic', color: 'blue' },
-        createdAt: new Date().toISOString(),
-        lastLogin: new Date().toISOString(),
-      };
-      await AsyncStorage.setItem(USER_KEY, JSON.stringify(newUser));
-      console.log('DB: Default user created and saved.');
-      return newUser;
-    }
-  } catch (error) {
-    console.error('DB Error in getOrCreateUser:', error);
-    // Fallback or re-throw depending on desired error handling
-    throw new Error('Failed to get or create user data.');
+export type BattleData = BattleRecord;
+
+interface AddExerciseInput {
+  userId: string;
+  type: ExerciseType;
+  count: number;
+  date: string;
+  powerGenerated: number;
+  formQuality: number;
+  source?: TrainingSource;
+  verificationTier?: VerificationTier;
+}
+
+export interface AddExerciseRecordResult {
+  exercise: ExerciseData;
+  trainingEvent: TrainingEvent;
+  ledgerRevision: number;
+}
+
+export interface LocalSaveData {
+  exportedAt: string;
+  users: UserData[];
+  exercises: ExerciseData[];
+  trainingEvents: TrainingEvent[];
+  statSnapshots: StatSnapshot[];
+  battles: BattleRecord[];
+}
+
+export class FitnessGameDB extends Dexie {
+  users!: Dexie.Table<UserData, string>;
+  exercises!: Dexie.Table<ExerciseData, string>;
+  trainingEvents!: Dexie.Table<TrainingEvent, string>;
+  statSnapshots!: Dexie.Table<StatSnapshot, string>;
+  battles!: Dexie.Table<BattleRecord, string>;
+
+  constructor() {
+    super('fitnessGameDB');
+
+    this.version(1).stores({
+      users: 'id, name, level, tier, lastLogin',
+      exercises: 'id, userId, type, date, [userId+date]',
+      battles: 'id, userId, bossId, date, result',
+    });
+
+    this.version(2)
+      .stores({
+        users: 'id, name, level, tier, lastLogin',
+        exercises: 'id, userId, type, date, localDate, [userId+localDate]',
+        trainingEvents:
+          'id, userId, exerciseId, localDate, performedAt, [userId+localDate], [userId+movementFamily]',
+        statSnapshots: 'id, userId, rulesVersion, generatedAt',
+        battles: 'id, userId, bossId, endedAt, result',
+      })
+      .upgrade(async tx => {
+        const users = tx.table('users');
+        const exercises = tx.table('exercises');
+        const trainingEvents = tx.table('trainingEvents');
+
+        const existingUsers = await users.toArray();
+        for (const user of existingUsers) {
+          await users.update(user.id, {
+            energy: typeof user.energy === 'number' ? user.energy : 100,
+            maxEnergy: typeof user.maxEnergy === 'number' ? user.maxEnergy : 100,
+            ledgerRevision:
+              typeof user.ledgerRevision === 'number' ? user.ledgerRevision : 0,
+          });
+        }
+
+        const existingExercises = await exercises.toArray();
+        let migratedCount = 0;
+
+        for (const exercise of existingExercises) {
+          const performedAt = exercise.performedAt || exercise.date || new Date().toISOString();
+          const event = createTrainingEvent({
+            id: `migration-${exercise.id}`,
+            userId: exercise.userId,
+            exerciseId: exercise.type,
+            count: exercise.count,
+            performedAt,
+            source: 'migration',
+            verificationTier: 'self_reported',
+            formScore: exercise.formQuality,
+          });
+          const credit = calculateCreditedVolume(event.exerciseId, event.rawVolume);
+
+          await exercises.update(exercise.id, {
+            performedAt: event.performedAt,
+            localDate: event.localDate,
+            rawVolume: event.rawVolume,
+            creditedVolume: event.creditedVolume,
+            creditExplanation: credit.explanation,
+          });
+
+          await trainingEvents.put(event);
+          migratedCount += 1;
+        }
+
+        if (migratedCount > 0) {
+          const userIds = new Set(existingExercises.map(exercise => exercise.userId));
+          for (const userId of userIds) {
+            const user = await users.get(userId);
+            await users.update(userId, {
+              ledgerRevision: (user?.ledgerRevision || 0) + migratedCount,
+            });
+          }
+        }
+      });
   }
 }
 
-export async function saveUserData(userData: UserData): Promise<void> {
-  console.log('DB: Saving user data...');
-  try {
-    await AsyncStorage.setItem(USER_KEY, JSON.stringify(userData));
-    console.log('DB: User data saved successfully.');
-  } catch (error) {
-    console.error('DB Error saving user data:', error);
-    throw new Error('Failed to save user data.');
-  }
-}
+export const db = new FitnessGameDB();
 
-// --- Exercise Data Functions ---
+export async function initializeUserIfNeeded(): Promise<string> {
+  const userCount = await db.users.count();
 
-export async function addExerciseRecord(exerciseData: Omit<Exercise, 'id'> & { userId: string }): Promise<Exercise> {
-  console.log('DB: Adding exercise record...');
-  try {
-    const historyString = await AsyncStorage.getItem(EXERCISE_HISTORY_KEY);
-    const history: Exercise[] = historyString ? JSON.parse(historyString) : [];
-
-    const id = generateId();
-    const newRecord: Exercise = {
-      ...exerciseData.exercise, // Get data from nested exercise object
-      id: id,
-      userId: exerciseData.userId, // Add userId
+  if (userCount === 0) {
+    const userId = generateId();
+    const newUser: UserData = {
+      id: userId,
+      name: 'Hero',
+      level: 1,
+      tier: 0,
+      experience: 0,
+      energy: 100,
+      maxEnergy: 100,
+      ledgerRevision: 0,
+      heroTitle: 'Beginner',
+      avatarCustomization: {
+        costume: 'basic',
+        color: 'blue',
+      },
+      createdAt: new Date().toISOString(),
+      lastLogin: new Date().toISOString(),
     };
 
-    history.push(newRecord);
-    await AsyncStorage.setItem(EXERCISE_HISTORY_KEY, JSON.stringify(history));
-    console.log('DB: Exercise record added successfully.');
-    return newRecord; // Return the full record with ID
-  } catch (error) {
-    console.error('DB Error adding exercise record:', error);
-    throw new Error('Failed to add exercise record.');
+    await db.users.add(newUser);
+    return userId;
   }
-}
 
-export async function getExercisesByDate(userId: string, date: string): Promise<Exercise[]> {
-  console.log(`DB: Getting exercises for user ${userId} on date ${date}...`);
-  try {
-    const historyString = await AsyncStorage.getItem(EXERCISE_HISTORY_KEY);
-    const history: Exercise[] = historyString ? JSON.parse(historyString) : [];
-
-    // Filter by userId and the date part of the ISO string
-    const datePrefix = date; // Assumes date is already YYYY-MM-DD
-    const filtered = history.filter(ex =>
-        ex.userId === userId &&
-        ex.date.startsWith(datePrefix)
-    );
-    console.log(`DB: Found ${filtered.length} exercises for ${date}.`);
-    return filtered;
-  } catch (error) {
-    console.error('DB Error getting exercises by date:', error);
-    throw new Error('Failed to get exercises by date.');
+  const firstUser = await db.users.toCollection().first();
+  if (firstUser) {
+    await ensureUserDefaults(firstUser);
   }
+  return firstUser?.id || '';
 }
 
-export async function getExercisesByDateRange(userId: string, startDate: string, endDate: string): Promise<Exercise[]> {
-    console.log(`DB: Getting exercises for user ${userId} between ${startDate} and ${endDate}...`);
-    try {
-        const historyString = await AsyncStorage.getItem(EXERCISE_HISTORY_KEY);
-        const history: Exercise[] = historyString ? JSON.parse(historyString) : [];
+export async function updateUserLogin(userId: string): Promise<void> {
+  await db.users.update(userId, {
+    lastLogin: new Date().toISOString(),
+  });
+}
 
-        // Filter by userId and date range (inclusive)
-        const start = startDate; // Assumes YYYY-MM-DD
-        const end = endDate;     // Assumes YYYY-MM-DD
-        const filtered = history.filter(ex =>
-            ex.userId === userId &&
-            ex.date.split('T')[0] >= start &&
-            ex.date.split('T')[0] <= end
-        );
-        console.log(`DB: Found ${filtered.length} exercises between ${startDate} and ${endDate}.`);
-        return filtered;
-    } catch (error) {
-        console.error('DB Error getting exercises by date range:', error);
-        throw new Error('Failed to get exercises by date range.');
+export async function addExerciseRecord(
+  exerciseData: AddExerciseInput
+): Promise<AddExerciseRecordResult> {
+  const id = generateId();
+  const event = createTrainingEvent({
+    id: `event-${id}`,
+    userId: exerciseData.userId,
+    exerciseId: exerciseData.type,
+    count: exerciseData.count,
+    performedAt: exerciseData.date,
+    source: exerciseData.source || 'manual',
+    verificationTier: exerciseData.verificationTier || 'self_reported',
+    formScore: exerciseData.formQuality,
+  });
+  const credit = calculateCreditedVolume(event.exerciseId, event.rawVolume);
+
+  const exercise: ExerciseData = {
+    id,
+    userId: exerciseData.userId,
+    type: exerciseData.type,
+    count: exerciseData.count,
+    date: event.performedAt,
+    performedAt: event.performedAt,
+    localDate: event.localDate,
+    rawVolume: event.rawVolume,
+    creditedVolume: event.creditedVolume,
+    creditExplanation: credit.explanation,
+    powerGenerated: exerciseData.powerGenerated,
+    formQuality: exerciseData.formQuality,
+  };
+
+  const ledgerRevision = await db.transaction(
+    'rw',
+    db.exercises,
+    db.trainingEvents,
+    db.users,
+    async () => {
+      await db.exercises.add(exercise);
+      await db.trainingEvents.add(event);
+      const user = await db.users.get(exerciseData.userId);
+      const nextLedgerRevision = (user?.ledgerRevision || 0) + 1;
+      await db.users.update(exerciseData.userId, {
+        ledgerRevision: nextLedgerRevision,
+      });
+      return nextLedgerRevision;
     }
+  );
+
+  return {
+    exercise,
+    trainingEvent: event,
+    ledgerRevision,
+  };
 }
 
-// --- Battle Data Functions (Example - Implement if needed) ---
+export async function getExercisesByDate(
+  userId: string,
+  localDate: string
+): Promise<ExerciseData[]> {
+  const records = await db.exercises
+    .where('[userId+localDate]')
+    .equals([userId, localDate])
+    .toArray();
 
-// export async function addBattleRecord(battleData: Omit<BattleData, 'id'>): Promise<string> {
-//   // Similar logic: get history, add new record, save history
-//   // ...
-// }
+  if (records.length > 0) {
+    return records;
+  }
 
-// export async function getBattleHistory(userId: string): Promise<BattleData[]> {
-//   // Similar logic: get history, filter by userId
-//   // ...
-// }
+  const legacyRecords = await db.exercises.where('userId').equals(userId).toArray();
+  return legacyRecords.filter(record => toLocalDate(record.performedAt || record.date) === localDate);
+}
 
-// --- Utility to clear data (for testing) ---
-export async function clearAllData() {
-    try {
-        await AsyncStorage.removeItem(USER_KEY);
-        await AsyncStorage.removeItem(EXERCISE_HISTORY_KEY);
-        await AsyncStorage.removeItem(BATTLE_HISTORY_KEY);
-        console.log('DB: All data cleared.');
-    } catch (error) {
-        console.error('DB Error clearing data:', error);
+export async function getExercisesByDateRange(
+  userId: string,
+  startDate: string,
+  endDate: string
+): Promise<ExerciseData[]> {
+  return db.exercises
+    .where('userId')
+    .equals(userId)
+    .and(item => {
+      const localDate = item.localDate || toLocalDate(item.performedAt || item.date);
+      return localDate >= startDate && localDate <= endDate;
+    })
+    .toArray();
+}
+
+export async function getTrainingEventsForUser(
+  userId: string
+): Promise<TrainingEvent[]> {
+  return db.trainingEvents.where('userId').equals(userId).sortBy('performedAt');
+}
+
+export async function saveStatSnapshot(snapshot: StatSnapshot): Promise<void> {
+  await db.statSnapshots.put(snapshot);
+}
+
+export async function getStatSnapshot(
+  userId: string
+): Promise<StatSnapshot | undefined> {
+  return db.statSnapshots.get(userId);
+}
+
+export async function addBattleRecord(
+  battleData: Omit<BattleRecord, 'id'>
+): Promise<string> {
+  const id = generateId();
+  await db.battles.add({
+    id,
+    ...battleData,
+  });
+  return id;
+}
+
+export async function getBattleHistory(userId: string): Promise<BattleRecord[]> {
+  return db.battles.where('userId').equals(userId).toArray();
+}
+
+export async function exportLocalSave(): Promise<LocalSaveData> {
+  return {
+    exportedAt: new Date().toISOString(),
+    users: await db.users.toArray(),
+    exercises: await db.exercises.toArray(),
+    trainingEvents: await db.trainingEvents.toArray(),
+    statSnapshots: await db.statSnapshots.toArray(),
+    battles: await db.battles.toArray(),
+  };
+}
+
+export async function importLocalSave(saveData: LocalSaveData): Promise<void> {
+  await db.transaction(
+    'rw',
+    db.users,
+    db.exercises,
+    db.trainingEvents,
+    db.statSnapshots,
+    db.battles,
+    async () => {
+      await db.users.clear();
+      await db.exercises.clear();
+      await db.trainingEvents.clear();
+      await db.statSnapshots.clear();
+      await db.battles.clear();
+      await db.users.bulkPut(saveData.users || []);
+      await db.exercises.bulkPut(saveData.exercises || []);
+      await db.trainingEvents.bulkPut(saveData.trainingEvents || []);
+      await db.statSnapshots.bulkPut(saveData.statSnapshots || []);
+      await db.battles.bulkPut(saveData.battles || []);
     }
+  );
 }
+
+export function getCreditSummary(exercise: ExerciseData): string {
+  return exercise.creditExplanation
+    ? exercise.creditExplanation
+    : `Credited ${displayVolume(exercise.type, exercise.creditedVolume || exercise.rawVolume || 0)}.`;
+}
+
+export function generateId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).substring(2);
+}
+
+async function ensureUserDefaults(user: Partial<UserData> & { id: string }): Promise<void> {
+  await db.users.update(user.id, {
+    energy: typeof user.energy === 'number' ? user.energy : 100,
+    maxEnergy: typeof user.maxEnergy === 'number' ? user.maxEnergy : 100,
+    ledgerRevision:
+      typeof user.ledgerRevision === 'number' ? user.ledgerRevision : 0,
+  });
+}
+

@@ -1,19 +1,14 @@
 import { createSlice, createAsyncThunk, PayloadAction } from '@reduxjs/toolkit';
-import { RootState } from '../../store/store'; // Adjust path if needed
-// Import energy action from userSlice
-import { addEnergy } from '../user/userSlice'; // Adjust path if needed
+import { RootState } from '../../store'; // Adjust path if needed
+import { addExerciseRecord, getExercisesByDate, ExerciseData } from '../../utils/database'; // Adjust path if needed
+// Import the action from userSlice
+import { addEnergy, setLedgerRevision } from '../user/userSlice'; // Adjust path if needed
+import { rebuildStatSnapshot } from '../progression/progressionSlice';
+import { ExerciseType as DomainExerciseType, toLocalDate } from '../../domain/training';
 
-// --- Types ---
-export type ExerciseType = 'pushup' | 'situp' | 'squat' | 'run';
-export interface Exercise {
-    id: string;
-    type: ExerciseType;
-    count: number;
-    date: string; // ISO string format
-    powerGenerated: number;
-    formQuality: number;
-    userId?: string;
-}
+// --- State and Types ---
+export type ExerciseType = DomainExerciseType;
+export interface Exercise extends ExerciseData {}
 
 interface ExerciseState {
     todayExercises: Exercise[];
@@ -21,61 +16,66 @@ interface ExerciseState {
     dailyGoals: { pushups: number; situps: number; squats: number; runDistance: number; };
     currentStreak: number;
     longestStreak: number;
-    lastWorkoutDate: string | null; // Store YYYY-MM-DD
+    lastWorkoutDate: string | null;
     totalPower: number;
     status: 'idle' | 'loading' | 'succeeded' | 'failed';
     error: string | null;
 }
 
 const initialState: ExerciseState = {
-    todayExercises: [], history: [],
+    todayExercises: [],
+    history: [],
     dailyGoals: { pushups: 10, situps: 10, squats: 10, runDistance: 1 }, // Example goals
-    currentStreak: 0, longestStreak: 0, lastWorkoutDate: null, totalPower: 0,
-    status: 'idle', error: null,
+    currentStreak: 0,
+    longestStreak: 0,
+    lastWorkoutDate: null,
+    totalPower: 0,
+    status: 'idle',
+    error: null,
 };
 
-// --- Mock DB Functions (Defined locally for now) ---
-const mockAddExerciseRecord = async (data: Omit<Exercise, 'id'> & { userId: string }): Promise<Exercise> => {
-    console.log('SLICE MOCK: Simulating save exercise:', data);
-    await new Promise(res => setTimeout(res, 300));
-    const savedExercise = { ...data.exercise, id: `ex_${Date.now().toString(36)}`, userId: data.userId };
-    return savedExercise;
-};
-const mockGetExercisesByDate = async (userId: string, date: string): Promise<Exercise[]> => {
-    console.log('SLICE MOCK: Simulating fetch exercises:', userId, date);
-    await new Promise(res => setTimeout(res, 200));
-    // Return empty array initially, will be populated by addExercise
-    return [];
-};
-// --- End Mock DB ---
-
-
-// --- Async Thunks ---
 export const fetchTodayExercises = createAsyncThunk<Exercise[], string, { state: RootState }>(
     'exercise/fetchToday',
     async (userId, { rejectWithValue }) => {
         try {
-            const today = new Date().toISOString().split('T')[0];
-            const response = await mockGetExercisesByDate(userId, today); // Uses local mock
-            return response;
+            const today = toLocalDate(new Date());
+            const response = await getExercisesByDate(userId, today);
+            return response as Exercise[];
         } catch (error: any) { return rejectWithValue(error.message); }
     }
 );
 
-interface AddExercisePayload { userId: string; exercise: Omit<Exercise, 'id'>; }
+interface AddExercisePayload {
+    userId: string;
+    exercise: {
+        type: ExerciseType;
+        count: number;
+        date: string;
+        powerGenerated: number;
+        formQuality: number;
+    };
+}
 export const addExercise = createAsyncThunk<Exercise, AddExercisePayload, { state: RootState }>(
     'exercise/addExercise',
     async (payload, { dispatch, rejectWithValue }) => {
         try {
-            const savedExercise = await mockAddExerciseRecord(payload); // Uses local mock
+            const { userId, exercise } = payload;
+            const dataToSave = { ...exercise, userId };
+            const result = await addExerciseRecord(dataToSave);
+            const savedExercise: Exercise = result.exercise;
+            dispatch(setLedgerRevision(result.ledgerRevision));
+            dispatch(rebuildStatSnapshot(userId));
+
             if (savedExercise.type === 'run') {
-                const energyGained = Math.round(savedExercise.powerGenerated / 2);
+                const energyGained = Math.round(savedExercise.creditedVolume / 1000);
                 if (energyGained > 0) { dispatch(addEnergy(energyGained)); }
             }
+
             return savedExercise;
         } catch (error: any) { return rejectWithValue(error.message); }
     }
 );
+
 
 // --- Slice Definition ---
 export const exerciseSlice = createSlice({
@@ -84,28 +84,35 @@ export const exerciseSlice = createSlice({
     reducers: {
         updateDailyGoals: (state, action: PayloadAction<Partial<ExerciseState['dailyGoals']>>) => { state.dailyGoals = { ...state.dailyGoals, ...action.payload }; },
         resetStreak: (state) => { state.currentStreak = 0; },
-        usePower: (state, action: PayloadAction<number>) => { state.totalPower = Math.max(0, state.totalPower - action.payload); },
+        usePower: (state, action: PayloadAction<number>) => {
+            console.warn(`usePower(${action.payload}) ignored: permanent training stats are not spendable.`);
+        },
     },
     extraReducers: (builder) => {
         builder
+            // Fetch Today Exercises
             .addCase(fetchTodayExercises.pending, (state) => { state.status = 'loading'; state.error = null; })
             .addCase(fetchTodayExercises.fulfilled, (state, action: PayloadAction<Exercise[]>) => { state.status = 'succeeded'; state.todayExercises = action.payload; })
-            .addCase(fetchTodayExercises.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload as string || 'Failed'; })
+            .addCase(fetchTodayExercises.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload as string || 'Failed to fetch exercises'; })
+            // Add Exercise
             .addCase(addExercise.pending, (state) => { state.status = 'loading'; state.error = null; })
             .addCase(addExercise.fulfilled, (state, action: PayloadAction<Exercise>) => {
                 state.status = 'succeeded';
                 const newExercise = action.payload;
                 if (!state.todayExercises.find(ex => ex.id === newExercise.id)) { state.todayExercises.push(newExercise); }
                 state.history.push(newExercise);
-                const { type, powerGenerated } = newExercise;
-                if (type === 'pushup' || type === 'situp' || type === 'squat') { state.totalPower += powerGenerated; }
+
+                // Update streak
                 const today = new Date(newExercise.date).toISOString().split('T')[0];
                 const lastWorkoutDatePart = state.lastWorkoutDate ? state.lastWorkoutDate.split('T')[0] : null;
                 if (lastWorkoutDatePart !== today) { state.currentStreak += 1; state.lastWorkoutDate = today; if (state.currentStreak > state.longestStreak) { state.longestStreak = state.currentStreak; } }
             })
-            .addCase(addExercise.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload as string || 'Failed'; });
+            .addCase(addExercise.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload as string || 'Failed to add exercise'; });
     },
 });
 
+// Export synchronous actions (including updated usePower)
 export const { updateDailyGoals, resetStreak, usePower } = exerciseSlice.actions;
+
+// Export the reducer
 export default exerciseSlice.reducer;

@@ -1,0 +1,18 @@
+{
+  "name": "Zero to Hero Coaching Demo",
+  "short_name": "Coach Demo",
+  "description": "A mobile-first bodyweight programme demo for trainers and clients.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#edf4ef",
+  "theme_color": "#0f766e",
+  "icons": [
+    {
+      "src": "/images/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
