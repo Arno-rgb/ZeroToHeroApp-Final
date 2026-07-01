@@ -1,0 +1,23 @@
+{
+  "name": "ZeroToHeroRoblox",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "ZeroToHeroShared": {
+        "$path": "src/shared"
+      }
+    },
+    "ServerScriptService": {
+      "ZeroToHeroServer": {
+        "$path": "src/server"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "ZeroToHeroClient": {
+          "$path": "src/client"
+        }
+      }
+    }
+  }
+}

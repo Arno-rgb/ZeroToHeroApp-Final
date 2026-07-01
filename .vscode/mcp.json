@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "robloxStudio": {
+      "type": "stdio",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\roblox-studio-mcp.ps1"
+      ]
+    }
+  }
+}
